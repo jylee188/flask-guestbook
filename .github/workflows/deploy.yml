@@ -1,49 +1,82 @@
 
-name: Build and Deploy Flask Guestbook
+name: 3-Tier Guestbook CI/CD
 
 on:
   push:
     branches: ["main"]
-
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: guestbook-production
+  cancel-in-progress: false
+
 jobs:
-  # 1. CI: Docker 이미지 빌드 및 업로드
+  # CI: 프론트엔드 + 백엔드 이미지 빌드
   build-and-push:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout source code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
+      - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push AMD64 image
+      # Frontend 이미지
+      - name: Build and push frontend
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./frontend
           platforms: linux/amd64
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/flask-guestbook:latest
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/flask-guestbook-frontend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/flask-guestbook-frontend:${{ github.sha }}
 
-  # 2. CD: Kakao Cloud 자동 배포
+      # Backend 이미지
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/flask-guestbook-backend:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/flask-guestbook-backend:${{ github.sha }}
+
+  # CD: Kakao Cloud 배포
   deploy:
     runs-on: ubuntu-latest
     needs: build-and-push
 
     steps:
-      - name: Deploy to Kakao Cloud via SSH
-        uses: appleboy/ssh-action@v1.2.0
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Compose 및 소스 파일 전송
+      - name: Copy project files to Kakao Cloud
+        uses: appleboy/scp-action@v1
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USERNAME }}
+          key: ${{ secrets.SERVER_KEY }}
+          port: ${{ secrets.SERVER_PORT }}
+          source: "docker-compose.yml,frontend,backend"
+          target: "/home/ubuntu/flask-guestbook"
+          overwrite: true
+
+      # 원격 Docker Compose 배포
+      - name: Deploy Docker Compose services
+        uses: appleboy/ssh-action@v1
         with:
           host: ${{ secrets.SERVER_HOST }}
           username: ${{ secrets.SERVER_USERNAME }}
@@ -52,34 +85,39 @@ jobs:
           script: |
             set -e
 
-            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/flask-guestbook:latest"
+            cd /home/ubuntu/flask-guestbook
 
-            echo "1. 최신 Docker 이미지 다운로드"
-            docker pull "$IMAGE"
+            # 서버에 보관된 환경변수 파일 확인
+            test -f .env
 
-            echo "2. 기존 방명록 컨테이너 제거"
-            docker rm -f guestbook 2>/dev/null || true
+            # 이번 커밋에 해당하는 이미지 사용
+            export IMAGE_TAG="${{ github.sha }}"
 
-            echo "3. 새 컨테이너 실행"
-            docker run -d \
-              --name guestbook \
-              --restart unless-stopped \
-              -p 80:5000 \
-              "$IMAGE"
+            echo "1. Docker Compose 설정 검사"
+            docker compose config --quiet
 
-            echo "4. 컨테이너 확인"
-            docker ps --filter name=guestbook
+            echo "2. 최신 이미지 다운로드"
+            docker compose pull frontend backend
 
-            echo "5. HTTP 응답 검증"
-            for i in 1 2 3 4 5; do
-              if curl -fsS http://127.0.0.1/ > /dev/null; then
+            echo "3. Docker Compose 재배포"
+            docker compose up -d --no-build --remove-orphans
+
+            echo "4. 컨테이너 상태 확인"
+            docker compose ps
+
+            echo "5. REST API 정상 작동 확인"
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if curl -fsS \
+                http://127.0.0.1/api/guestbook \
+                > /dev/null; then
                 echo "배포 성공!"
                 exit 0
               fi
+
               sleep 2
             done
 
             echo "배포 검증 실패"
-            docker logs guestbook
+            docker compose logs --tail=50
             exit 1
 
